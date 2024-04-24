@@ -15,6 +15,7 @@ Mirco Ravanelli, 2023
 import pickle
 import os
 import torch
+import time
 from hyperpyyaml import load_hyperpyyaml
 from torch.nn import init
 import numpy as np
@@ -24,6 +25,10 @@ from utils.dataio_iterators import LeaveOneSessionOut, LeaveOneSubjectOut
 from torchinfo import summary
 import speechbrain as sb
 import yaml
+from graphing.TrainMetricGraph import TrainMetricGraph
+from graphing.TrainTimeGraph import TrainTimeGraph
+from graphing.EegDataGraph import EegDataGraph
+from graphing.ConvLayerGraph import ConvLayerGraph
 
 
 class MOABBBrain(sb.Brain):
@@ -38,6 +43,8 @@ class MOABBBrain(sb.Brain):
             if hasattr(mod, "bias"):
                 if mod.bias is not None:
                     init.constant_(mod.bias, 0)
+
+        self.base_model = model
 
     def compute_forward(self, batch, stage):
         "Given an input batch it computes the model output."
@@ -100,14 +107,21 @@ class MOABBBrain(sb.Brain):
 
     def on_stage_start(self, stage, epoch=None):
         "Gets called when a stage (either training, validation, test) starts."
+
+        self.stage_start_time = time.time()
+
         if stage != sb.Stage.TRAIN:
             self.preds = []
             self.targets = []
 
     def on_stage_end(self, stage, stage_loss, epoch=None):
         """Gets called at the end of a epoch."""
+
+        train_time_graph.update_epoch_train_time(epoch, time.time() - self.stage_start_time)
+
         if stage == sb.Stage.TRAIN:
             self.train_loss = stage_loss
+            train_metric_graph.update_epoch_train_loss(epoch, stage_loss)
         else:
             preds = np.array(self.preds)
             y_pred = np.argmax(preds, axis=-1)
@@ -179,6 +193,11 @@ class MOABBBrain(sb.Brain):
                         min_keys=min_keys,
                         max_keys=max_keys,
                     )
+
+                # Update the graph
+                train_metric_graph.update_epoch_valid_loss(epoch, self.last_eval_stats['loss'])
+                train_metric_graph.update_epoch_valid_f1(epoch, self.last_eval_stats['f1'])
+                train_metric_graph.update_epoch_valid_acc(epoch, self.last_eval_stats['acc'])
 
             elif stage == sb.Stage.TEST:
                 self.hparams.train_logger.log_stats(
@@ -293,6 +312,7 @@ def run_experiment(hparams, run_opts, datasets):
         run_opts=run_opts,
         checkpointer=checkpointer,
     )
+
     # training
     brain.fit(
         epoch_counter=hparams["epoch_counter"],
@@ -307,9 +327,34 @@ def run_experiment(hparams, run_opts, datasets):
     brain.hparams.avg_models = 1
     perform_evaluation(brain, hparams, datasets, dataset_key="valid")
 
+    # Draw and save graphs to files, if the model used is compatible
+
+    # Strings are being used here instead of class references in order not to have to import all the models
+    compatible_graph_models = ["ShallowConvNet", "ShallowConvNetWithELA", "EEGNet", "EEGNetWithELA"]
+    compatible_attention_graph_models = ["ShallowConvNetWithELA", "EEGNetWithELA"]
+    base_model_class_name = brain.base_model.__class__.__name__
+
+    if base_model_class_name in compatible_graph_models:
+
+        # Draw and save train metrics, train time, original EEG input example, intermediate map after conv_module
+        train_metric_graph.print_graph(destination=os.path.join(hparams["exp_dir"], "graphs"))
+        train_time_graph.print_graph(destination=os.path.join(hparams["exp_dir"], "graphs"))
+        graphed_sample = datasets['train'].dataset.tensors[0][None, 0, :, :, :].to(brain.device)
+        eeg_data_graph.print_graph(graphed_sample[0, :, :, :], destination=os.path.join(hparams["exp_dir"], "graphs"))
+        conv_out = brain.base_model.conv_module(graphed_sample)
+        conv_layer_graph.print_graph(conv_out[0, :, :, :], show_attention=False, destination=os.path.join(hparams["exp_dir"], "graphs"))
+
+        # If the model uses attention, draw and save an example
+        if base_model_class_name in compatible_attention_graph_models:
+            _, attention_map = brain.base_model.attention_module(conv_out, save_map=True)
+            conv_layer_graph.print_graph(conv_out[0, :, :, :], show_attention=True, attention_map=attention_map, destination=os.path.join(hparams["exp_dir"], "graphs"))
+
 
 def perform_evaluation(brain, hparams, datasets, dataset_key="test"):
-    """This function perform the evaluation stage on a dataset and save the performance metrics in a pickle file"""
+    """
+        This function perform the evaluation stage on a dataset and save the performance metrics in a pickle file
+    """
+
     brain.log_test_as_valid = dataset_key == "valid"
 
     min_key, max_key = None, None
@@ -412,6 +457,12 @@ if __name__ == "__main__":
     hparams, datasets = load_hparams_and_dataset_iterators(
         hparams_file, run_opts, overrides
     )
+
+    # Instantate various graphs to explore the model
+    train_metric_graph = TrainMetricGraph()
+    train_time_graph = TrainTimeGraph()
+    eeg_data_graph = EegDataGraph()
+    conv_layer_graph = ConvLayerGraph()
 
     # Run training
     run_experiment(hparams, run_opts, datasets)

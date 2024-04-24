@@ -66,7 +66,7 @@ config_file="hparams/orion/hparams_tpe.yaml"
 mne_dir=""
 orion_db_address=""
 orion_db_type="PickledDB"
-exp_max_trials=50
+exp_max_trials= 5
 store_all=True
 compress_exp=True
 
